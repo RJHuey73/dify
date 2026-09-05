@@ -189,6 +189,139 @@ def test_text_exists_and_metadata_operations(myscale_module):
     assert vector._client.command.call_count >= 2
 
 
+# --- SQL injection regression tests -----------------------------------------
+#
+# text_exists, delete_by_ids, get_ids_by_metadata_field, and delete_by_metadata_field
+# used to f-string-interpolate their id/key/value arguments directly into SQL text
+# with no escaping at all. These tests pin the fix: values must always come out
+# through the same MyScaleVector.escape_str treatment already applied to
+# page_content, and metadata field keys (used as a bare SQL identifier, not a
+# quoted value) must be validated rather than interpolated raw.
+
+MALICIOUS_VALUE = "'; DROP TABLE x--"
+MALICIOUS_ID = "' OR '1'='1"
+MALICIOUS_KEY = "key'); DROP TABLE x;--"
+
+
+def test_text_exists_escapes_malicious_id(myscale_module):
+    vector = myscale_module.MyScaleVector("collection_1", _config(myscale_module))
+    vector._client.query.return_value = SimpleNamespace(row_count=0, result_rows=[])
+    escape = myscale_module.MyScaleVector.escape_str
+
+    vector.text_exists(MALICIOUS_ID)
+
+    sql = vector._client.query.call_args.args[0]
+    # The raw payload (with its live quotes) must never survive into the query text...
+    assert MALICIOUS_ID not in sql
+    # ...it must instead go through the same escaping as page_content, still
+    # wrapped in a single-quoted string literal.
+    assert f"id='{escape(MALICIOUS_ID)}'" in sql
+
+
+def test_text_exists_round_trips_normal_id(myscale_module):
+    vector = myscale_module.MyScaleVector("collection_1", _config(myscale_module))
+    vector._client.query.return_value = SimpleNamespace(row_count=1, result_rows=[])
+
+    assert vector.text_exists("normal-id-123") is True
+    sql = vector._client.query.call_args.args[0]
+    assert "id='normal-id-123'" in sql
+
+
+def test_delete_by_ids_escapes_each_id_individually(myscale_module):
+    vector = myscale_module.MyScaleVector("collection_1", _config(myscale_module))
+    vector._client.command.reset_mock()
+    escape = myscale_module.MyScaleVector.escape_str
+    normal_id = "id-42"
+
+    vector.delete_by_ids([normal_id, MALICIOUS_ID])
+
+    sql = vector._client.command.call_args.args[0]
+    assert MALICIOUS_ID not in sql
+    assert f"'{escape(normal_id)}'" in sql
+    assert f"'{escape(MALICIOUS_ID)}'" in sql
+    # Exactly two quoted, individually-escaped, comma-joined values -- the
+    # malicious id must not be able to close its own literal early and inject
+    # extra tokens into the IN (...) clause.
+    assert sql.count("'") == 4
+
+
+def test_delete_by_ids_single_id_has_no_trailing_comma(myscale_module):
+    # Regression guard: the old `str(tuple(ids))` left a dangling trailing
+    # comma for a single-element list (`('only-id',)`); the rebuilt clause
+    # should not.
+    vector = myscale_module.MyScaleVector("collection_1", _config(myscale_module))
+    vector._client.command.reset_mock()
+
+    vector.delete_by_ids(["only-id"])
+
+    sql = vector._client.command.call_args.args[0]
+    assert "WHERE id IN ('only-id')" in sql
+
+
+def test_get_ids_by_metadata_field_escapes_malicious_value(myscale_module):
+    vector = myscale_module.MyScaleVector("collection_1", _config(myscale_module))
+    vector._client.query.return_value = SimpleNamespace(row_count=0, result_rows=[])
+    escape = myscale_module.MyScaleVector.escape_str
+
+    vector.get_ids_by_metadata_field("document_id", MALICIOUS_VALUE)
+
+    sql = vector._client.query.call_args.args[0]
+    assert MALICIOUS_VALUE not in sql
+    assert f"metadata.document_id='{escape(MALICIOUS_VALUE)}'" in sql
+
+
+def test_get_ids_by_metadata_field_rejects_malicious_key(myscale_module):
+    vector = myscale_module.MyScaleVector("collection_1", _config(myscale_module))
+
+    with pytest.raises(ValueError, match="Invalid characters in metadata field key"):
+        vector.get_ids_by_metadata_field(MALICIOUS_KEY, "value")
+    vector._client.query.assert_not_called()
+
+
+def test_delete_by_metadata_field_escapes_malicious_value(myscale_module):
+    vector = myscale_module.MyScaleVector("collection_1", _config(myscale_module))
+    vector._client.command.reset_mock()
+    escape = myscale_module.MyScaleVector.escape_str
+
+    vector.delete_by_metadata_field("document_id", MALICIOUS_VALUE)
+
+    sql = vector._client.command.call_args.args[0]
+    assert MALICIOUS_VALUE not in sql
+    assert f"metadata.document_id='{escape(MALICIOUS_VALUE)}'" in sql
+
+
+def test_delete_by_metadata_field_rejects_malicious_key(myscale_module):
+    vector = myscale_module.MyScaleVector("collection_1", _config(myscale_module))
+    vector._client.command.reset_mock()
+
+    with pytest.raises(ValueError, match="Invalid characters in metadata field key"):
+        vector.delete_by_metadata_field(MALICIOUS_KEY, "value")
+    vector._client.command.assert_not_called()
+
+
+def test_metadata_field_key_allows_normal_identifiers(myscale_module):
+    vector = myscale_module.MyScaleVector("collection_1", _config(myscale_module))
+    vector._client.query.return_value = SimpleNamespace(row_count=0, result_rows=[])
+
+    # Simple identifiers and dotted/nested field names (the only shapes any
+    # real caller in this codebase ever passes) must keep working unescaped.
+    for key in ("document_id", "annotation_id", "app_id", "nested.field"):
+        vector.get_ids_by_metadata_field(key, "value")
+        sql = vector._client.query.call_args.args[0]
+        assert f"metadata.{key}=" in sql
+
+
+def test_numeric_looking_values_are_still_quoted_as_string_literals(myscale_module):
+    vector = myscale_module.MyScaleVector("collection_1", _config(myscale_module))
+    vector._client.query.return_value = SimpleNamespace(row_count=1, result_rows=[])
+
+    vector.text_exists("12345")
+    assert "id='12345'" in vector._client.query.call_args.args[0]
+
+    vector.get_ids_by_metadata_field("document_id", "67890")
+    assert "metadata.document_id='67890'" in vector._client.query.call_args.args[0]
+
+
 def test_search_delegation_methods(myscale_module):
     vector = myscale_module.MyScaleVector("collection_1", _config(myscale_module))
     vector._search = MagicMock(return_value=["result"])

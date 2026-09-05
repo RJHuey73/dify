@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import uuid
 from enum import StrEnum
 from typing import Any, override
@@ -16,6 +17,15 @@ from core.rag.models.document import Document
 from models.dataset import Dataset
 
 logger = logging.getLogger(__name__)
+
+# Metadata field keys (e.g. passed to `get_ids_by_metadata_field`/`delete_by_metadata_field`)
+# are interpolated directly into the SQL text as an identifier (`metadata.<key>`), not as a
+# quoted string value, so `MyScaleVector.escape_str` (designed for values that are wrapped in
+# `'...'`) cannot safely protect this position: escaping quotes/backslashes does nothing to
+# stop someone from closing the identifier early with e.g. a space, parenthesis, or SQL
+# keyword. Instead, only the limited character set a legitimate metadata field name needs is
+# allowed through.
+_SAFE_METADATA_KEY_RE = re.compile(r"[A-Za-z0-9_.]+")
 
 
 class MyScaleConfig(BaseModel):
@@ -100,30 +110,47 @@ class MyScaleVector(BaseVector):
     def escape_str(value: Any) -> str:
         return "".join(" " if c in {"\\", "'"} else c for c in str(value))
 
+    @staticmethod
+    def _safe_metadata_key(key: str) -> str:
+        """Validate a metadata field name used as a SQL identifier (`metadata.<key>`).
+
+        Raises ValueError if `key` contains anything outside the allowed
+        identifier character set, rather than trying to escape it — see the
+        module-level `_SAFE_METADATA_KEY_RE` docstring comment for why.
+        """
+        if not _SAFE_METADATA_KEY_RE.fullmatch(key):
+            raise ValueError(f"Invalid characters in metadata field key: {key!r}")
+        return key
+
     @override
     def text_exists(self, id: str) -> bool:
-        results = self._client.query(f"SELECT id FROM {self._config.database}.{self._collection_name} WHERE id='{id}'")
+        results = self._client.query(
+            f"SELECT id FROM {self._config.database}.{self._collection_name} WHERE id='{self.escape_str(id)}'"
+        )
         return results.row_count > 0
 
     @override
     def delete_by_ids(self, ids: list[str]):
         if not ids:
             return
-        self._client.command(
-            f"DELETE FROM {self._config.database}.{self._collection_name} WHERE id IN {str(tuple(ids))}"
-        )
+        quoted_ids = ",".join(f"'{self.escape_str(doc_id)}'" for doc_id in ids)
+        self._client.command(f"DELETE FROM {self._config.database}.{self._collection_name} WHERE id IN ({quoted_ids})")
 
     @override
     def get_ids_by_metadata_field(self, key: str, value: str):
+        safe_key = self._safe_metadata_key(key)
         rows = self._client.query(
-            f"SELECT DISTINCT id FROM {self._config.database}.{self._collection_name} WHERE metadata.{key}='{value}'"
+            f"SELECT DISTINCT id FROM {self._config.database}.{self._collection_name} "
+            f"WHERE metadata.{safe_key}='{self.escape_str(value)}'"
         ).result_rows
         return [row[0] for row in rows]
 
     @override
     def delete_by_metadata_field(self, key: str, value: str):
+        safe_key = self._safe_metadata_key(key)
         self._client.command(
-            f"DELETE FROM {self._config.database}.{self._collection_name} WHERE metadata.{key}='{value}'"
+            f"DELETE FROM {self._config.database}.{self._collection_name} "
+            f"WHERE metadata.{safe_key}='{self.escape_str(value)}'"
         )
 
     @override
