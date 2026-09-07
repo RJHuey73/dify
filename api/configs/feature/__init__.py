@@ -645,6 +645,21 @@ class HttpConfig(BaseSettings):
         default=5.0,
     )
 
+    SSRF_ALLOWED_HOSTS: str | None = Field(
+        description=(
+            "Comma-separated allowlist exempting specific targets from the in-process "
+            "SSRF address block (which otherwise rejects any request whose resolved IP "
+            "is private, loopback, link-local, reserved, or multicast). Each entry is "
+            "either a literal hostname (matched case-insensitively against the request "
+            "URL's host) or an IP/CIDR range (matched against the resolved address), e.g. "
+            "`internal-api.example.com,10.20.0.0/24`. Use this to permit a trusted "
+            "internal HTTP Request node target in a self-hosted deployment. Only applies "
+            "when no SSRF_PROXY_* forward proxy is configured -- see ssrf_proxy.py. "
+            "Default empty: no exemptions, all private/internal-use addresses are blocked."
+        ),
+        default=None,
+    )
+
     RESPECT_XFORWARD_HEADERS_ENABLED: bool = Field(
         description="Enable handling of X-Forwarded-For, X-Forwarded-Proto, and X-Forwarded-Port headers"
         " when the app is behind a single trusted reverse proxy.",
