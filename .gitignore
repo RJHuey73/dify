@@ -262,3 +262,6 @@ scripts/stress-test/reports/
 
 # Vitest local reports
 web/.vitest-reports/
+
+# CI verification touch (no-op) — confirms CI runs after enabling GitHub Actions on this fork.
+
